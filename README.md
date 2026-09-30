@@ -270,13 +270,11 @@ The main highlight of this project is the emphasis on location of the customer n
 
 ### AI used in the product
 
-- **Google Gemini**: real-time lead analysis and conversational sales assistance.
+- **Google Gemini**, specifically the Flash-Lite version, is the engine behind the interactive model in the web app.
 
 ### AI used while building the project
+I have used AI extensively for developing this project. A prototype was made using **Gemini Pro**, then more features were added using **ChatGPT**. The Supabase and Vercel integration was done by me, but I faced some errors during the deployment, where I used **ChatGPT** to debug it.
 
-- **ChatGPT**: architecture brainstorming, implementation help, UI iteration, prompt design, debugging, code review, and troubleshooting during development.
-
-The submitted application still contains a real AI API integration and is not based on canned AI responses.
 
 ---
 
