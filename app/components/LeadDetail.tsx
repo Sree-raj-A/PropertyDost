@@ -1,18 +1,582 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useState,
+  type FormEvent,
+} from "react";
+
 import { DEMO_PROFILE } from "../lib/demo-profile";
+import LeadLocationMap from "./LeadLocationMap";
+import PropertyHeatMap from "./PropertyHeatMap";
 
 type Message = {
   role: "user" | "assistant";
   content: string;
 };
 
-type MarketArea = {
-  name: string;
-  price: string;
-  level: "high" | "medium" | "low";
+type Analysis = {
+  ai_title?: string;
+  summary?: string;
+  intent?: string;
+  key_requirements?: string;
+  objections?: string;
+  recommended_next_action?: string;
+  suggested_response?: string;
+  score?: number;
+  priority?: string;
+  urgency?: number;
 };
+
+type ResponseMode =
+  | "strategy"
+  | "suggested_response";
+
+const MIN_INTENT_LENGTH = 80;
+const VISIBLE_SUGGESTIONS = 3;
+const CHAT_STORAGE_PREFIX = "masal-chat-thread-";
+
+/* ============================================================
+   CHAT STORAGE
+============================================================ */
+
+function getChatStorageKey(
+  leadId: string | number
+) {
+  return `${CHAT_STORAGE_PREFIX}${String(leadId)}`;
+}
+
+/* ============================================================
+   TEXT HELPERS
+============================================================ */
+
+function cleanText(
+  value: unknown
+): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim();
+}
+
+function isPlaceholderConcern(
+  value: unknown
+): boolean {
+  const text = cleanText(value)
+    .toLowerCase()
+    .replace(/[.!?]+$/g, "")
+    .trim();
+
+  if (!text) {
+    return true;
+  }
+
+  const placeholders = [
+    "none",
+    "none identified",
+    "none identified here",
+    "no concerns",
+    "no concerns identified",
+    "no objections",
+    "no objections identified",
+    "no issues",
+    "no issues identified",
+    "nothing identified",
+    "not identified",
+    "n/a",
+    "na",
+    "unknown",
+  ];
+
+  return placeholders.includes(text);
+}
+
+/* ============================================================
+   BULLET PARSER
+============================================================ */
+
+function toBulletItems(
+  value: unknown
+): string[] {
+  const text = cleanText(value);
+
+  if (!text) {
+    return [];
+  }
+
+  return text
+    .split(
+      /\r?\n|;|•|(?<=\.)\s+(?=[A-Z][^.!?]{2,80}:)/
+    )
+    .map((item) =>
+      item
+        .replace(/^\s*[-*•]\s*/, "")
+        .replace(/^\s*\d+[.)]\s*/, "")
+        .trim()
+    )
+    .filter((item) => item.length > 2);
+}
+
+/* ============================================================
+   CONCERN INFERENCE
+============================================================ */
+
+function inferConcern(
+  lead: any,
+  analysis?: Analysis
+): string {
+  const name =
+    cleanText(lead.name) ||
+    "The customer";
+
+  const location =
+    cleanText(lead.location) ||
+    "the target location";
+
+  const property =
+    cleanText(
+      lead.property_requirement ??
+        lead.propertyType
+    ) ||
+    "the requested property";
+
+  const budget = cleanText(
+    lead.budget
+  );
+
+  const timeline = cleanText(
+    lead.timeline
+  );
+
+  const originalMessage =
+    cleanText(
+      lead.original_message ??
+        lead.customer_message ??
+        lead.message ??
+        lead.snippet
+    ).toLowerCase();
+
+  const intent = cleanText(
+    analysis?.intent ?? lead.intent
+  ).toLowerCase();
+
+  if (
+    /compar|shortlist|few options|multiple|several|compare/.test(
+      originalMessage + " " + intent
+    )
+  ) {
+    return `${name} may be concerned about choosing between competing ${property} options in ${location}, especially comparing overall value before committing.`;
+  }
+
+  if (
+    budget &&
+    property &&
+    timeline
+  ) {
+    return `${name}'s main likely concern is whether suitable ${property} inventory in ${location} can fit the ${budget} budget while still meeting the ${timeline} buying timeline.`;
+  }
+
+  if (
+    timeline &&
+    /asap|immediate|urgent|this month|this week|soon/i.test(
+      timeline
+    )
+  ) {
+    return `${name}'s main likely concern is availability and whether the right property can be secured quickly enough for the stated ${timeline} timeline.`;
+  }
+
+  if (
+    location &&
+    property
+  ) {
+    return `${name}'s likely concern is finding a ${property} in ${location} that matches the required combination of price, condition, and availability.`;
+  }
+
+  return `${name}'s likely concern is ensuring the available options match the stated requirements, budget, and purchase timing closely enough to justify moving forward.`;
+}
+
+/* ============================================================
+   NORMALIZE AI RESPONSE
+============================================================ */
+
+function normalizeAnalysis(
+  result: any
+): Analysis {
+  const source =
+    result?.analysis ??
+    result?.data ??
+    result ??
+    {};
+
+  return {
+    ai_title:
+      source.ai_title ??
+      source.aiTitle ??
+      "",
+
+    summary:
+      source.summary ??
+      source.lead_summary ??
+      "",
+
+    intent:
+      source.intent ??
+      source.customer_intent ??
+      "",
+
+    key_requirements:
+      source.key_requirements ??
+      source.keyRequirements ??
+      "",
+
+    objections:
+      source.objections ??
+      source.concerns ??
+      "",
+
+    recommended_next_action:
+      source.recommended_next_action ??
+      source.recommendedNextAction ??
+      "",
+
+    suggested_response:
+      source.suggested_response ??
+      source.suggestedResponse ??
+      "",
+
+    score:
+      Number.isFinite(
+        Number(source.score)
+      )
+        ? Number(source.score)
+        : undefined,
+
+    priority:
+      source.priority ?? undefined,
+
+    urgency:
+      Number.isFinite(
+        Number(source.urgency)
+      )
+        ? Number(source.urgency)
+        : undefined,
+  };
+}
+
+/* ============================================================
+   LEAD PAYLOAD
+============================================================ */
+
+function buildLeadPayload(
+  lead: any
+) {
+  return {
+    name: lead.name ?? "",
+
+    location: lead.location ?? "",
+
+    property_requirement:
+      lead.property_requirement ??
+      lead.propertyType ??
+      "",
+
+    propertyRequirement:
+      lead.property_requirement ??
+      lead.propertyType ??
+      "",
+
+    budget: lead.budget ?? "",
+
+    timeline: lead.timeline ?? "",
+
+    original_message:
+      lead.original_message ??
+      lead.customer_message ??
+      lead.message ??
+      lead.snippet ??
+      lead.summary ??
+      "",
+
+    customer_message:
+      lead.customer_message ??
+      lead.original_message ??
+      lead.message ??
+      lead.snippet ??
+      lead.summary ??
+      "",
+
+    message:
+      lead.message ??
+      lead.original_message ??
+      lead.snippet ??
+      lead.summary ??
+      "",
+
+    urgency: lead.urgency ?? 3,
+  };
+}
+
+/* ============================================================
+   ANALYSIS COMPLETENESS
+============================================================ */
+
+function hasMissingCoreAnalysis(
+  analysis: Analysis
+) {
+  const intent = cleanText(
+    analysis.intent
+  );
+
+  return (
+    !cleanText(analysis.summary) ||
+    intent.length < MIN_INTENT_LENGTH ||
+    !cleanText(
+      analysis.key_requirements
+    ) ||
+    isPlaceholderConcern(
+      analysis.objections
+    ) ||
+    !cleanText(
+      analysis.recommended_next_action
+    ) ||
+    !cleanText(
+      analysis.suggested_response
+    )
+  );
+}
+
+/* ============================================================
+   OPENING ASSISTANT MESSAGE
+============================================================ */
+
+function buildOpeningMessage(
+  lead: any,
+  analysis: Analysis
+) {
+  const summary = cleanText(
+    analysis.summary
+  );
+
+  const concern = cleanText(
+    analysis.objections
+  );
+
+  const nextAction = cleanText(
+    analysis.recommended_next_action
+  );
+
+  if (
+    summary &&
+    concern &&
+    nextAction
+  ) {
+    return `${summary} The main issue to watch is ${concern
+      .charAt(0)
+      .toLowerCase()}${concern.slice(
+      1
+    )} The immediate focus should be to ${nextAction
+      .charAt(0)
+      .toLowerCase()}${nextAction.slice(
+      1
+    )}`;
+  }
+
+  if (
+    summary &&
+    nextAction
+  ) {
+    return `${summary} The immediate focus should be to ${nextAction
+      .charAt(0)
+      .toLowerCase()}${nextAction.slice(
+      1
+    )}`;
+  }
+
+  return `The customer is looking for ${
+    lead.property_requirement ??
+    lead.propertyType ??
+    "a property"
+  } in ${
+    lead.location ??
+    "the selected area"
+  } within a budget of ${
+    lead.budget ??
+    "the stated budget"
+  }.`;
+}
+
+/* ============================================================
+   12 CONSUMABLE SUGGESTIONS
+============================================================ */
+
+function buildSuggestionPool(
+  lead: any
+): string[] {
+  const name =
+    cleanText(lead.name) ||
+    "this customer";
+
+  const location =
+    cleanText(lead.location) ||
+    "this location";
+
+  const property =
+    cleanText(
+      lead.property_requirement ??
+        lead.propertyType
+    ) || "property";
+
+  const budget =
+    cleanText(lead.budget) ||
+    "the stated budget";
+
+  const timeline =
+    cleanText(lead.timeline) ||
+    "the stated timeline";
+
+  return [
+    `What should I emphasize when I speak with ${name}?`,
+    `What are the strongest buying signals in ${name}'s ${property} search?`,
+    `What concern should I address first with ${name}?`,
+    `How should I position ${location} for this customer?`,
+    `How should I frame the ${budget} budget without creating friction?`,
+    `What requirement should I prioritize when showing ${property} options?`,
+    `What could delay this deal given the ${timeline} timeline?`,
+    `Give me a sharper opening for my first call with ${name}.`,
+    `Make the suggested response more assertive.`,
+    `Make the suggested response warmer and more conversational.`,
+    `What should I say if price becomes the main objection?`,
+    `What is the strongest next step after my first conversation with ${name}?`,
+  ];
+}
+
+/* ============================================================
+   STRATEGY QUESTION DETECTION
+============================================================ */
+
+function isStrategyQuestion(
+  question: string
+): boolean {
+  const q = question
+    .toLowerCase()
+    .trim();
+
+  return (
+    q.includes("what should i emphasize") ||
+    q.includes("what should i focus on") ||
+    q.includes("what should i highlight") ||
+    q.includes("key talking points") ||
+    q.includes("key leverage points") ||
+    q.includes("strongest buying signals") ||
+    q.includes("what concern should i address") ||
+    q.includes("what concern should i prepare") ||
+    q.includes("how should i position") ||
+    q.includes("what could delay this deal") ||
+    q.includes("what is the strongest next step") ||
+    q.includes("biggest objections") ||
+    q.includes("what should i know before the call") ||
+    q.includes("how should i handle the customer") ||
+    q.includes("how should i approach the customer")
+  );
+}
+
+/* ============================================================
+   CUSTOMER-FACING REQUEST DETECTION
+============================================================ */
+
+function isCustomerFacingRequest(
+  question: string
+): boolean {
+  const q = question
+    .toLowerCase()
+    .trim();
+
+  /*
+   * Anything asking the system to WRITE or REWRITE
+   * something for the customer belongs in Suggested Response.
+   *
+   * This intentionally catches:
+   *
+   *   "Rewrite a more friendly tone"
+   *   "Rewrite the response"
+   *   "Make it more assertive"
+   *   "Write something to send"
+   *   "Draft a message"
+   */
+  const writingPatterns = [
+    "suggested response",
+    "suggested reply",
+
+    "write a follow-up",
+    "write a message",
+    "write a reply",
+    "write a response",
+
+    "draft a message",
+    "draft a reply",
+    "draft a response",
+
+    "rewrite",
+    "rewrite the response",
+    "rewrite my response",
+    "rewrite the reply",
+    "rewrite my reply",
+
+    "make the response",
+    "make the reply",
+    "make the draft",
+    "make draft",
+
+    "change the tone",
+    "change tone",
+    "friendly tone",
+    "warmer tone",
+    "friendlier",
+    "more friendly",
+    "more warm",
+    "warmer and more conversational",
+    "more conversational",
+
+    "more assertive",
+    "more concise",
+    "more professional",
+    "less formal",
+    "more casual",
+    "more direct",
+
+    "shorten the message",
+    "shorten the response",
+
+    "improve the message",
+    "improve the response",
+
+    "polish the message",
+    "polish the response",
+
+    "what should i send",
+    "what should i message",
+    "what should i reply",
+
+    "what should i say to the customer",
+    "what should i tell the customer",
+
+    "message to send",
+    "reply to send",
+
+    "customer-facing",
+    "customer facing",
+  ];
+
+  return writingPatterns.some(
+    (pattern) =>
+      q.includes(pattern)
+  );
+}
+
+/* ============================================================
+   COMPONENT
+============================================================ */
 
 export default function LeadDetail({
   lead,
@@ -23,424 +587,755 @@ export default function LeadDetail({
   onBack: () => void;
   salespersonName: string;
 }) {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState("");
-  const [loadingHistory, setLoadingHistory] = useState(true);
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState("");
-  const [copied, setCopied] = useState(false);
+  /* ==========================================================
+     CHAT
+  ========================================================== */
 
-  const [suggestedResponse, setSuggestedResponse] =
-    useState<string>(
+  const [
+    messages,
+    setMessages,
+  ] = useState<Message[]>(
+    []
+  );
+
+  const [
+    input,
+    setInput,
+  ] = useState("");
+
+  const [
+    loadingHistory,
+    setLoadingHistory,
+  ] = useState(true);
+
+  const [
+    generatingAnalysis,
+    setGeneratingAnalysis,
+  ] = useState(false);
+
+  const [
+    sending,
+    setSending,
+  ] = useState(false);
+
+  const [
+    error,
+    setError,
+  ] = useState("");
+
+  /* ==========================================================
+     FOLLOW-UP
+  ========================================================== */
+
+  const [
+    copied,
+    setCopied,
+  ] = useState(false);
+
+  const [
+    followUpUpdated,
+    setFollowUpUpdated,
+  ] = useState(false);
+
+  /* ==========================================================
+     CONSUMABLE SUGGESTIONS
+  ========================================================== */
+
+  const [
+    visibleSuggestions,
+    setVisibleSuggestions,
+  ] = useState<string[]>(
+    []
+  );
+
+  const [
+    remainingSuggestions,
+    setRemainingSuggestions,
+  ] = useState<string[]>(
+    []
+  );
+
+  /* ==========================================================
+     ANALYSIS
+  ========================================================== */
+
+  const [
+    analysis,
+    setAnalysis,
+  ] = useState<Analysis>({
+    ai_title:
+      lead.ai_title ??
+      lead.aiTitle ??
+      "",
+
+    summary:
+      lead.summary ??
+      lead.snippet ??
+      "",
+
+    intent:
+      lead.intent ??
+      "",
+
+    key_requirements:
+      lead.key_requirements ??
+      lead.keyRequirements ??
+      "",
+
+    objections:
+      lead.objections ??
+      "",
+
+    recommended_next_action:
+      lead.recommended_next_action ??
+      lead.recommendedNextAction ??
+      "",
+
+    suggested_response:
+      lead.suggested_response ??
       lead.suggestedResponse ??
-        lead.suggested_response ??
-        ""
-    );
+      "",
 
-  const [responseGlow, setResponseGlow] = useState(false);
+    score:
+      Number.isFinite(
+        Number(lead.score)
+      )
+        ? Number(lead.score)
+        : undefined,
 
-  const [quickPrompts, setQuickPrompts] =
-    useState<string[]>([]);
+    priority:
+      lead.priority ??
+      undefined,
 
-  const [remainingPrompts, setRemainingPrompts] =
-    useState<string[]>([]);
+    urgency:
+      Number.isFinite(
+        Number(lead.urgency)
+      )
+        ? Number(lead.urgency)
+        : undefined,
+  });
 
-  /* =========================================================
-     BASIC LEAD DATA
-  ========================================================= */
+  /* ==========================================================
+     CREATE 12 SUGGESTIONS
+  ========================================================== */
 
-  const leadTitle =
-    lead.ai_title ??
-    lead.aiTitle ??
-    lead.name ??
-    "Lead";
+  useEffect(() => {
+    const all =
+      buildSuggestionPool(
+        lead
+      );
 
-  const leadSummary =
-    lead.summary ??
-    lead.snippet ??
-    "No analysis available.";
-
-  const leadIntent =
-    lead.intent ??
-    "No intent analysis available.";
-
-  const keyRequirements =
-    lead.keyRequirements ??
-    lead.key_requirements ??
-    "None identified.";
-
-  const objections =
-    lead.objections ??
-    "None identified.";
-
-  const recommendedAction =
-    lead.recommendedNextAction ??
-    lead.recommended_next_action ??
-    "Thinking...";
-
-  const buyingWindow =
-    lead.timeline ??
-    lead.buyingWindow ??
-    "";
-
-  /* =========================================================
-     GOOGLE MAP
-  ========================================================= */
-
-  const mapsKey =
-    process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-
-  const mapUrl = useMemo(() => {
-    if (!mapsKey || !lead.location) {
-      return "";
-    }
-
-    const query = encodeURIComponent(
-      `${lead.location}, India`
-    );
-
-    return (
-      "https://www.google.com/maps/embed/v1/place" +
-      `?key=${mapsKey}&q=${query}`
-    );
-  }, [mapsKey, lead.location]);
-
-  const mapsSearchUrl = useMemo(() => {
-    if (!lead.location) {
-      return "#";
-    }
-
-    return (
-      "https://www.google.com/maps/search/?api=1&query=" +
-      encodeURIComponent(
-        `${lead.location}, India`
+    setVisibleSuggestions(
+      all.slice(
+        0,
+        VISIBLE_SUGGESTIONS
       )
     );
-  }, [lead.location]);
 
-  /* =========================================================
-     ILLUSTRATIVE MARKET DATA
-  ========================================================= */
+    setRemainingSuggestions(
+      all.slice(
+        VISIBLE_SUGGESTIONS
+      )
+    );
+  }, [lead.id]);
 
-  const marketAreas: MarketArea[] = [
-    {
-      name: "Indiranagar",
-      price: "₹18,500/sq.ft",
-      level: "high",
-    },
-    {
-      name: "Koramangala",
-      price: "₹16,800/sq.ft",
-      level: "high",
-    },
-    {
-      name: "HSR Layout",
-      price: "₹12,900/sq.ft",
-      level: "medium",
-    },
-    {
-      name: "Whitefield",
-      price: "₹10,700/sq.ft",
-      level: "medium",
-    },
-    {
-      name: "Sarjapur Road",
-      price: "₹9,200/sq.ft",
-      level: "low",
-    },
-  ];
+  /* ==========================================================
+     CONSUME SUGGESTION
+  ========================================================== */
 
-  /* =========================================================
-     CONSUMABLE PROMPTS
-  ========================================================= */
+  const consumeSuggestion =
+    (
+      suggestion: string
+    ) => {
+      setInput(
+        suggestion
+      );
 
-  useEffect(() => {
-    const property =
-      lead.propertyType ??
-      lead.property_requirement ??
-      "this property";
+      setVisibleSuggestions(
+        (current) =>
+          current.filter(
+            (item) =>
+              item !==
+              suggestion
+          )
+      );
 
-    const location =
-      lead.location ??
-      "the requested location";
-
-    const budget =
-      lead.budget ??
-      "the stated budget";
-
-    const objectionsText = String(
-      lead.objections ?? ""
-    ).trim();
-
-    const firstObjection =
-      objectionsText
-        .split(";")[0]
-        ?.trim() ?? "";
-
-    const prompts = [
-      `What should I emphasize about ${property}?`,
-      `How should I position ${location} for this customer?`,
-      "What should I say on the first call?",
-      "What is the customer's strongest buying signal?",
-      "What is the biggest risk in this lead?",
-      "What should I ask the customer next?",
-      "Give me three talking points for this lead.",
-      "How should I handle the customer's main concern?",
-      firstObjection
-        ? `How should I handle ${firstObjection}?`
-        : "What concern should I probe further?",
-      `How should I discuss the ${budget} budget?`,
-      "What could prevent this deal from progressing?",
-      "What would make this customer more likely to book a viewing?",
-      "Summarize the customer in three bullet points.",
-      "What information am I still missing?",
-      "Write a concise call opening.",
-      "Write a concise WhatsApp follow-up.",
-      "Make the follow-up more assertive.",
-      "Make the follow-up warmer.",
-      "Make the follow-up shorter.",
-      "What should my next action be after the customer's reply?",
-    ];
-
-    setQuickPrompts(prompts.slice(0, 3));
-    setRemainingPrompts(prompts.slice(3));
-  }, [
-    lead.id,
-    lead.propertyType,
-    lead.property_requirement,
-    lead.location,
-    lead.budget,
-    lead.objections,
-  ]);
-
-  /* =========================================================
-     LOAD CHAT HISTORY
-  ========================================================= */
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadHistory() {
-      try {
-        setLoadingHistory(true);
-        setError("");
-
-        const response = await fetch(
-          `/api/leads/${lead.id}/chat/history`,
-          {
-            cache: "no-store",
+      setRemainingSuggestions(
+        (current) => {
+          if (
+            current.length ===
+            0
+          ) {
+            return current;
           }
+
+          const [
+            next,
+            ...rest
+          ] = current;
+
+          setVisibleSuggestions(
+            (currentVisible) => [
+              ...currentVisible,
+              next,
+            ]
+          );
+
+          return rest;
+        }
+      );
+    };
+
+  /* ==========================================================
+     GENERATE / COMPLETE ANALYSIS
+  ========================================================== */
+
+  const generateAnalysis =
+    async (): Promise<Analysis | null> => {
+      try {
+        setGeneratingAnalysis(
+          true
         );
 
-        if (!response.ok) {
-          if (!cancelled) {
-            setMessages([]);
-          }
+        const base =
+          buildLeadPayload(
+            lead
+          );
 
-          return;
-        }
+        const response =
+          await fetch(
+            "/api/analyze-lead",
+            {
+              method: "POST",
+
+              headers: {
+                "Content-Type":
+                  "application/json",
+              },
+
+              body: JSON.stringify(
+                {
+                  ...base,
+
+                  analysis_requirements:
+                    {
+                      customer_intent:
+                        "Write 2-3 complete sentences, approximately 30-70 words. Explain what the customer is trying to accomplish, why they are buying, their priorities, timing, and important constraints. Never return a short label.",
+
+                      key_requirements:
+                        "Extract concrete property, location, budget, timeline, lifestyle, financing, or other requirements.",
+
+                      objections:
+                        "Always return useful concerns. If the customer explicitly states a concern, use it. If none is explicitly stated, infer the most relevant likely concern from budget, timing, requirements, comparison behavior, or availability. Never return None identified, No concerns, N/A, or an empty value.",
+
+                      recommended_next_action:
+                        "Give one concrete salesperson-ready next step.",
+
+                      suggested_response:
+                        "Write a natural customer-facing response grounded in the lead.",
+                    },
+                }
+              ),
+            }
+          );
 
         const result =
           await response.json();
 
-        if (cancelled) {
-          return;
+        if (
+          !response.ok
+        ) {
+          throw new Error(
+            result.error ??
+              "AI analysis failed."
+          );
+        }
+
+        const generated =
+          normalizeAnalysis(
+            result
+          );
+
+        if (
+          isPlaceholderConcern(
+            generated.objections
+          )
+        ) {
+          generated.objections =
+            inferConcern(
+              lead,
+              generated
+            );
         }
 
         if (
-          result.success &&
-          Array.isArray(result.messages)
+          !cleanText(
+            generated.intent
+          ) ||
+          cleanText(
+            generated.intent
+          ).length <
+            MIN_INTENT_LENGTH
         ) {
-          setMessages(
-            result.messages.map(
-              (item: any) => ({
-                role:
-                  item.role === "user"
-                    ? "user"
-                    : "assistant",
-                content: String(
-                  item.content ?? ""
-                ),
-              })
-            )
-          );
+          generated.intent =
+            generated.summary
+              ? `${generated.summary} The decision is likely to depend on how well the available options match the customer's stated requirements, budget, and buying timeline.`
+              : `The customer is actively evaluating a ${
+                  lead.property_requirement ??
+                  lead.propertyType ??
+                  "property"
+                } in ${
+                  lead.location ??
+                  "the target location"
+                }, with the decision primarily shaped by the stated budget, requirements, and purchase timeline.`;
         }
+
+        setAnalysis(
+          (current) => ({
+            ...current,
+            ...generated,
+          })
+        );
+
+        return generated;
       } catch (err) {
         console.error(
-          "History loading error:",
+          "Analysis generation error:",
           err
         );
 
-        if (!cancelled) {
-          setMessages([]);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingHistory(false);
-        }
-      }
-    }
+        setAnalysis(
+          (current) => ({
+            ...current,
 
-    loadHistory();
+            objections:
+              isPlaceholderConcern(
+                current.objections
+              )
+                ? inferConcern(
+                    lead,
+                    current
+                  )
+                : current.objections,
+          })
+        );
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Unable to generate lead analysis."
+        );
+
+        return null;
+      } finally {
+        setGeneratingAnalysis(
+          false
+        );
+      }
+    };
+
+  /* ==========================================================
+     INITIALIZE LEAD + RESTORE CHAT
+  ========================================================== */
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const initialize =
+      async () => {
+        try {
+          setLoadingHistory(
+            true
+          );
+
+          setError("");
+
+          const storageKey =
+            getChatStorageKey(
+              lead.id
+            );
+
+          /*
+           * Restore local chat first.
+           */
+          try {
+            const cached =
+              localStorage.getItem(
+                storageKey
+              );
+
+            if (cached) {
+              const parsed =
+                JSON.parse(
+                  cached
+                );
+
+              if (
+                Array.isArray(
+                  parsed
+                ) &&
+                parsed.length > 0
+              ) {
+                setMessages(
+                  parsed
+                );
+
+                return;
+              }
+            }
+          } catch (
+            cacheError
+          ) {
+            console.warn(
+              "Could not restore cached chat:",
+              cacheError
+            );
+          }
+
+          /*
+           * Complete analysis if needed.
+           */
+          let currentAnalysis =
+            analysis;
+
+          if (
+            hasMissingCoreAnalysis(
+              currentAnalysis
+            )
+          ) {
+            const generated =
+              await generateAnalysis();
+
+            if (
+              generated
+            ) {
+              currentAnalysis =
+                {
+                  ...currentAnalysis,
+                  ...generated,
+                };
+            }
+          }
+
+          if (
+            isPlaceholderConcern(
+              currentAnalysis.objections
+            )
+          ) {
+            currentAnalysis = {
+              ...currentAnalysis,
+
+              objections:
+                inferConcern(
+                  lead,
+                  currentAnalysis
+                ),
+            };
+
+            setAnalysis(
+              currentAnalysis
+            );
+          }
+
+          if (
+            cancelled
+          ) {
+            return;
+          }
+
+          /*
+           * Try persistent server history.
+           */
+          try {
+            const historyResponse =
+              await fetch(
+                `/api/leads/${lead.id}/chat/history`,
+                {
+                  cache:
+                    "no-store",
+                }
+              );
+
+            if (
+              historyResponse.ok
+            ) {
+              const historyResult =
+                await historyResponse.json();
+
+              const history =
+                historyResult.success &&
+                Array.isArray(
+                  historyResult.messages
+                )
+                  ? historyResult.messages.map(
+                      (
+                        message: any
+                      ) => ({
+                        role:
+                          message.role ===
+                          "user"
+                            ? "user"
+                            : "assistant",
+
+                        content:
+                          message.content,
+                      })
+                    )
+                  : [];
+
+              if (
+                history.length >
+                0
+              ) {
+                setMessages(
+                  history
+                );
+
+                try {
+                  localStorage.setItem(
+                    storageKey,
+                    JSON.stringify(
+                      history
+                    )
+                  );
+                } catch {}
+
+                return;
+              }
+            }
+          } catch {
+            /*
+             * Normal for demo/new leads.
+             */
+          }
+
+          if (
+            cancelled
+          ) {
+            return;
+          }
+
+          /*
+           * New conversation.
+           */
+          const openingMessage: Message =
+            {
+              role:
+                "assistant",
+
+              content:
+                buildOpeningMessage(
+                  lead,
+                  currentAnalysis
+                ),
+            };
+
+          setMessages([
+            openingMessage,
+          ]);
+
+          try {
+            localStorage.setItem(
+              storageKey,
+              JSON.stringify([
+                openingMessage,
+              ])
+            );
+          } catch {}
+        } catch (err) {
+          if (
+            cancelled
+          ) {
+            return;
+          }
+
+          console.error(
+            "Lead initialization error:",
+            err
+          );
+
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Unable to initialize this lead."
+          );
+        } finally {
+          if (
+            !cancelled
+          ) {
+            setLoadingHistory(
+              false
+            );
+          }
+        }
+      };
+
+    initialize();
 
     return () => {
       cancelled = true;
     };
+
+    /*
+     * Only reset when a different lead is opened.
+     */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lead.id]);
 
-  /* =========================================================
-     AI TEXT FORMATTING
-  ========================================================= */
+  /* ==========================================================
+     PERSIST CHAT
+  ========================================================== */
 
-  function renderInline(text: string) {
-    const parts =
-      text.split(
-        /(\*\*.*?\*\*)/g
-      );
-
-    return parts.map(
-      (part, index) => {
-        if (
-          part.startsWith("**") &&
-          part.endsWith("**")
-        ) {
-          return (
-            <strong key={index}>
-              {part.slice(2, -2)}
-            </strong>
-          );
-        }
-
-        return (
-          <span key={index}>
-            {part}
-          </span>
-        );
-      }
-    );
-  }
-
-  function renderAIText(
-    text: string
-  ) {
-    const cleaned =
-      String(text ?? "")
-        .replace(/\r/g, "")
-        .replace(
-          /^#{1,6}\s*/gm,
-          ""
-        )
-        .replace(
-          /^Draft Response:\s*/gim,
-          ""
-        )
-        .replace(
-          /^Here is .*?:\s*/gim,
-          ""
-        )
-        .trim();
-
-    const lines =
-      cleaned.split("\n");
-
-    return (
-      <div className="space-y-2">
-        {lines.map(
-          (line, index) => {
-            const trimmed =
-              line.trim();
-
-            if (!trimmed) {
-              return (
-                <div
-                  key={index}
-                  className="h-1"
-                />
-              );
-            }
-
-            if (
-              trimmed.startsWith("- ") ||
-              trimmed.startsWith("* ")
-            ) {
-              return (
-                <div
-                  key={index}
-                  className="flex gap-2"
-                >
-                  <span>•</span>
-
-                  <span>
-                    {renderInline(
-                      trimmed.slice(2)
-                    )}
-                  </span>
-                </div>
-              );
-            }
-
-            return (
-              <p key={index}>
-                {renderInline(
-                  trimmed
-                )}
-              </p>
-            );
-          }
-        )}
-      </div>
-    );
-  }
-
-  /* =========================================================
-     SEND MESSAGE
-  ========================================================= */
-
-  async function handleSend(
-    event: React.FormEvent
-  ) {
-    event.preventDefault();
-
-    const text =
-      input.trim();
-
-    if (!text || sending) {
+  useEffect(() => {
+    if (
+      messages.length ===
+      0
+    ) {
       return;
     }
 
-    setInput("");
-    setSending(true);
-    setError("");
-
-    setMessages(
-      (current) => [
-        ...current,
-        {
-          role: "user",
-          content: text,
-        },
-      ]
-    );
-
     try {
+      localStorage.setItem(
+        getChatStorageKey(
+          lead.id
+        ),
+        JSON.stringify(
+          messages
+        )
+      );
+    } catch (error) {
+      console.warn(
+        "Could not persist chat:",
+        error
+      );
+    }
+  }, [
+    messages,
+    lead.id,
+  ]);
+
+  /* ==========================================================
+     AI FALLBACK
+  ========================================================== */
+
+  const askAnalysisFallback =
+    async (
+      question: string,
+      responseMode: ResponseMode
+    ) => {
+      const context =
+        buildLeadPayload(
+          lead
+        );
+
+      const prompt =
+        responseMode ===
+        "suggested_response"
+          ? `
+You are helping a real-estate salesperson.
+
+Write the revised customer-facing message requested below.
+
+The result must be ONLY the message that can be sent directly to the customer.
+
+Do not explain your reasoning.
+Do not speak to the salesperson.
+Do not prefix it with "Suggested response".
+Do not use markdown.
+
+Lead:
+${context.name}
+
+Location:
+${context.location}
+
+Property:
+${context.property_requirement}
+
+Budget:
+${context.budget}
+
+Timeline:
+${context.timeline}
+
+Current suggested response:
+${analysis.suggested_response ?? ""}
+
+Salesperson request:
+${question}
+          `.trim()
+          : `
+You are helping a real-estate salesperson.
+
+Answer the salesperson's strategy question directly.
+
+This is NOT a customer message.
+
+Do NOT write "Hi ${context.name}".
+Do NOT write a message for the customer.
+Do NOT turn the answer into a suggested reply.
+
+Explain what the salesperson should emphasize, why it matters, what concern to address, or what sales tactic to use, depending on the question.
+
+Lead:
+${context.name}
+
+Location:
+${context.location}
+
+Property:
+${context.property_requirement}
+
+Budget:
+${context.budget}
+
+Timeline:
+${context.timeline}
+
+Summary:
+${analysis.summary ?? ""}
+
+Intent:
+${analysis.intent ?? ""}
+
+Requirements:
+${analysis.key_requirements ?? ""}
+
+Concerns:
+${analysis.objections ?? ""}
+
+Recommended next action:
+${analysis.recommended_next_action ?? ""}
+
+Salesperson question:
+${question}
+          `.trim();
+
       const response =
         await fetch(
-          `/api/leads/${lead.id}/chat`,
+          "/api/analyze-lead",
           {
             method: "POST",
+
             headers: {
               "Content-Type":
                 "application/json",
             },
-            body:
-              JSON.stringify({
-                message: text,
-                salespersonName,
-                salespersonLocation:
-                  DEMO_PROFILE.location,
-                salespersonPhone:
-                  DEMO_PROFILE.phone,
-              }),
+
+            body: JSON.stringify(
+              {
+                ...context,
+
+                original_message:
+                  prompt,
+
+                customer_message:
+                  prompt,
+
+                message:
+                  prompt,
+              }
+            ),
           }
         );
 
@@ -448,172 +1343,501 @@ export default function LeadDetail({
         await response.json();
 
       if (
-        !response.ok ||
-        !result.success
+        !response.ok
       ) {
         throw new Error(
           result.error ??
-            "Unable to get a response."
+            "Unable to generate an AI answer."
         );
       }
 
+      const generated =
+        normalizeAnalysis(
+          result
+        );
+
+      return (
+        generated.suggested_response ||
+        generated.summary ||
+        generated.intent ||
+        ""
+      );
+    };
+
+  /* ==========================================================
+     UPDATE LEFT SUGGESTED RESPONSE
+  ========================================================== */
+
+  const updateSuggestedResponse =
+    (
+      text: string
+    ) => {
+      const cleaned =
+        cleanText(text);
+
+      if (!cleaned) {
+        return;
+      }
+
+      setAnalysis(
+        (current) => ({
+          ...current,
+          suggested_response:
+            cleaned,
+        })
+      );
+
+      setFollowUpUpdated(
+        true
+      );
+
+      setTimeout(
+        () =>
+          setFollowUpUpdated(
+            false
+          ),
+        2200
+      );
+    };
+
+  /* ==========================================================
+     SEND CHAT
+  ========================================================== */
+
+  const handleSend =
+    async (
+      event: FormEvent
+    ) => {
+      event.preventDefault();
+
+      const message =
+        input.trim();
+
+      if (
+        !message ||
+        sending
+      ) {
+        return;
+      }
+
+      setInput("");
+      setSending(true);
+      setError("");
+
+      /*
+       * Always show what the salesperson typed.
+       */
       setMessages(
         (current) => [
           ...current,
           {
-            role: "assistant",
-            content:
-              result.message ??
-              "",
+            role: "user",
+            content: message,
           },
         ]
       );
 
-      if (
-        result.updateSuggestedResponse &&
-        result.suggestedResponse
-      ) {
-        setSuggestedResponse(
-          result.suggestedResponse
+      /*
+       * Classification happens BEFORE the API request.
+       *
+       * "Rewrite a more friendly tone"
+       * "Make it more assertive"
+       * "Write a follow-up"
+       *
+       * all become suggested_response requests.
+       */
+      const customerFacing =
+        isCustomerFacingRequest(
+          message
         );
 
-        setResponseGlow(true);
+      const responseMode: ResponseMode =
+        customerFacing
+          ? "suggested_response"
+          : "strategy";
 
-        window.setTimeout(
-          () => {
-            setResponseGlow(false);
-          },
-          1800
-        );
-      }
-    } catch (err) {
-      console.error(
-        "Chat error:",
-        err
-      );
+      try {
+        const response =
+          await fetch(
+            `/api/leads/${lead.id}/chat`,
+            {
+              method:
+                "POST",
 
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong."
-      );
-    } finally {
-      setSending(false);
-    }
-  }
+              headers: {
+                "Content-Type":
+                  "application/json",
+              },
 
-  /* =========================================================
-     CONSUME PROMPT
-  ========================================================= */
+              body: JSON.stringify(
+                {
+                  message,
+                  responseMode,
 
-  function usePrompt(
-    prompt: string
-  ) {
-    setInput(prompt);
+                  salespersonName,
 
-    setQuickPrompts(
-      (current) => {
-        const clickedIndex =
-          current.indexOf(
-            prompt
+                  salespersonLocation:
+                    DEMO_PROFILE.location,
+
+                  salespersonPhone:
+                    DEMO_PROFILE.phone,
+
+                  leadContext: {
+                    id:
+                      lead.id,
+
+                    name:
+                      lead.name,
+
+                    location:
+                      lead.location,
+
+                    property_requirement:
+                      lead.property_requirement ??
+                      lead.propertyType,
+
+                    budget:
+                      lead.budget,
+
+                    timeline:
+                      lead.timeline,
+
+                    original_message:
+                      lead.original_message ??
+                      lead.customer_message ??
+                      lead.message ??
+                      lead.snippet,
+
+                    ...analysis,
+
+                    objections:
+                      isPlaceholderConcern(
+                        analysis.objections
+                      )
+                        ? inferConcern(
+                            lead,
+                            analysis
+                          )
+                        : analysis.objections,
+                  },
+                }
+              ),
+            }
+          );
+
+        const result =
+          await response.json();
+
+        if (
+          response.ok &&
+          result.success &&
+          result.message
+        ) {
+          /*
+           * CUSTOMER-FACING REQUEST
+           *
+           * Actual generated customer text ONLY
+           * goes into Suggested Response.
+           */
+          if (
+            responseMode ===
+            "suggested_response"
+          ) {
+            updateSuggestedResponse(
+              result.message
+            );
+
+            setMessages(
+              (current) => [
+                ...current,
+                {
+                  role:
+                    "assistant",
+                  content:
+                    "Done. I’ve updated the Suggested Response on the left.",
+                },
+              ]
+            );
+
+            return;
+          }
+
+          /*
+           * STRATEGY REQUEST
+           *
+           * This belongs in the main chat.
+           */
+          setMessages(
+            (current) => [
+              ...current,
+              {
+                role:
+                  "assistant",
+                content:
+                  result.message,
+              },
+            ]
+          );
+
+          return;
+        }
+
+        /*
+         * New/demo lead that isn't persisted:
+         * use the analysis endpoint instead.
+         */
+        const fallbackAnswer =
+          await askAnalysisFallback(
+            message,
+            responseMode
           );
 
         if (
-          clickedIndex ===
-          -1
+          responseMode ===
+          "suggested_response"
         ) {
-          return current;
+          updateSuggestedResponse(
+            fallbackAnswer
+          );
+
+          setMessages(
+            (current) => [
+              ...current,
+              {
+                role:
+                  "assistant",
+                content:
+                  "Done. I’ve updated the Suggested Response on the left.",
+              },
+            ]
+          );
+
+          return;
         }
 
-        const replacement =
-          remainingPrompts[0];
-
-        if (replacement) {
-          const next =
-            [...current];
-
-          next[clickedIndex] =
-            replacement;
-
-          return next;
-        }
-
-        return current.filter(
-          (_, index) =>
-            index !==
-            clickedIndex
+        setMessages(
+          (current) => [
+            ...current,
+            {
+              role:
+                "assistant",
+              content:
+                fallbackAnswer,
+            },
+          ]
         );
+      } catch (err) {
+        console.error(
+          "Chat error:",
+          err
+        );
+
+        /*
+         * Second attempt through analysis endpoint.
+         */
+        try {
+          const fallbackAnswer =
+            await askAnalysisFallback(
+              message,
+              responseMode
+            );
+
+          if (
+            responseMode ===
+            "suggested_response"
+          ) {
+            updateSuggestedResponse(
+              fallbackAnswer
+            );
+
+            setMessages(
+              (current) => [
+                ...current,
+                {
+                  role:
+                    "assistant",
+                  content:
+                    "Done. I’ve updated the Suggested Response on the left.",
+                },
+              ]
+            );
+
+            return;
+          }
+
+          setMessages(
+            (current) => [
+              ...current,
+              {
+                role:
+                  "assistant",
+                content:
+                  fallbackAnswer,
+              },
+            ]
+          );
+        } catch (
+          fallbackError
+        ) {
+          console.error(
+            "Fallback AI error:",
+            fallbackError
+          );
+
+          setError(
+            fallbackError instanceof
+              Error
+              ? fallbackError.message
+              : "Unable to get an AI response."
+          );
+        }
+      } finally {
+        setSending(false);
       }
+    };
+
+  /* ==========================================================
+     QUICK PROMPT
+  ========================================================== */
+
+  const usePrompt =
+    (
+      prompt: string
+    ) => {
+      setInput(
+        prompt
+      );
+    };
+
+  /* ==========================================================
+     COPY RESPONSE
+  ========================================================== */
+
+  const copyResponse =
+    async () => {
+      const response =
+        analysis.suggested_response ??
+        lead.suggested_response ??
+        "";
+
+      if (!response) {
+        return;
+      }
+
+      try {
+        await navigator.clipboard.writeText(
+          response
+        );
+
+        setCopied(true);
+
+        setTimeout(
+          () =>
+            setCopied(false),
+          1500
+        );
+      } catch {}
+    };
+
+  /* ==========================================================
+     DISPLAY VALUES
+  ========================================================== */
+
+  const displaySummary =
+    cleanText(
+      analysis.summary
+    ) ||
+    cleanText(
+      lead.summary
+    ) ||
+    cleanText(
+      lead.snippet
+    ) ||
+    "Generating...";
+
+  const requirementItems =
+    toBulletItems(
+      cleanText(
+        analysis.key_requirements
+      ) ||
+        cleanText(
+          lead.key_requirements
+        ) ||
+        cleanText(
+          lead.keyRequirements
+        )
     );
 
-    setRemainingPrompts(
-      (current) =>
-        current.length > 0
-          ? current.slice(1)
-          : current
+  const concernText =
+    isPlaceholderConcern(
+      analysis.objections
+    ) &&
+    isPlaceholderConcern(
+      lead.objections
+    )
+      ? inferConcern(
+          lead,
+          analysis
+        )
+      : cleanText(
+          analysis.objections
+        ) ||
+        cleanText(
+          lead.objections
+        ) ||
+        inferConcern(
+          lead,
+          analysis
+        );
+
+  const concernItems =
+    toBulletItems(
+      concernText
     );
-  }
 
-  /* =========================================================
-     COPY FOLLOW-UP
-  ========================================================= */
+  const displayNextAction =
+    cleanText(
+      analysis.recommended_next_action
+    ) ||
+    cleanText(
+      lead.recommended_next_action
+    ) ||
+    cleanText(
+      lead.recommendedNextAction
+    ) ||
+    (generatingAnalysis
+      ? "Generating..."
+      : "Generate the next best action.");
 
-  async function copyResponse() {
-    if (
-      !suggestedResponse
-    ) {
-      return;
-    }
+  const displaySuggestedResponse =
+    cleanText(
+      analysis.suggested_response
+    ) ||
+    cleanText(
+      lead.suggested_response
+    ) ||
+    cleanText(
+      lead.suggestedResponse
+    ) ||
+    (generatingAnalysis
+      ? "Generating..."
+      : "Generate a suggested response.");
 
-    try {
-      await navigator.clipboard.writeText(
-        suggestedResponse
-      );
+  const displayScore =
+    analysis.score ??
+    lead.score ??
+    0;
 
-      setCopied(true);
-
-      window.setTimeout(
-        () => {
-          setCopied(false);
-        },
-        1500
-      );
-    } catch (err) {
-      console.error(
-        "Clipboard error:",
-        err
-      );
-    }
-  }
-
-  /* =========================================================
-     MARKET BAR
-  ========================================================= */
-
-  function marketBarClass(
-    level: MarketArea["level"]
-  ) {
-    if (level === "high") {
-      return "h-full w-[92%] rounded-full bg-red-500";
-    }
-
-    if (level === "medium") {
-      return "h-full w-[65%] rounded-full bg-orange-400";
-    }
-
-    return "h-full w-[40%] rounded-full bg-emerald-500";
-  }
-
-  /* =========================================================
+  /* ==========================================================
      RENDER
-  ========================================================= */
+  ========================================================== */
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-zinc-100 font-sans">
+    <div className="flex h-screen flex-col overflow-hidden bg-zinc-100 font-sans">
 
-      {/* =====================================================
+      {/* ======================================================
           TOP BAR
-      ===================================================== */}
+      ====================================================== */}
 
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-zinc-200 bg-white px-6">
 
@@ -622,7 +1846,7 @@ export default function LeadDetail({
           <button
             type="button"
             onClick={onBack}
-            className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950"
+            className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-zinc-600 transition-colors hover:bg-zinc-100 hover:text-zinc-950"
           >
             ← Inbox
           </button>
@@ -632,7 +1856,10 @@ export default function LeadDetail({
           <div className="min-w-0">
 
             <h2 className="truncate text-sm font-semibold text-zinc-900">
-              {leadTitle}
+              {lead.ai_title ||
+                lead.aiTitle ||
+                analysis.ai_title ||
+                lead.name}
             </h2>
 
             <p className="mt-0.5 truncate text-[11px] text-zinc-400">
@@ -648,10 +1875,8 @@ export default function LeadDetail({
 
           <button
             type="button"
-            onClick={
-              copyResponse
-            }
-            className="rounded-lg bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-200"
+            onClick={copyResponse}
+            className="rounded-lg bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-700 transition-colors hover:bg-zinc-200"
           >
             {copied
               ? "Copied"
@@ -660,7 +1885,7 @@ export default function LeadDetail({
 
           <a
             href={`tel:${DEMO_PROFILE.phone}`}
-            className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+            className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-indigo-700"
           >
             ☎ Contact Client
           </a>
@@ -668,21 +1893,21 @@ export default function LeadDetail({
         </div>
       </header>
 
-      {/* =====================================================
+      {/* ======================================================
           BODY
-      ===================================================== */}
+      ====================================================== */}
 
       <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-4">
 
-        {/* ===================================================
+        {/* ====================================================
             LEFT DOSSIER
-        =================================================== */}
+        ==================================================== */}
 
         <section className="flex min-h-0 w-1/2 flex-col overflow-y-auto rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
 
-          {/* Header */}
+          {/* HEADER */}
 
-          <div className="mb-6 flex shrink-0 items-center justify-between border-b border-zinc-100 pb-4">
+          <div className="mb-6 flex items-center justify-between border-b border-zinc-100 pb-4">
 
             <div>
 
@@ -697,43 +1922,30 @@ export default function LeadDetail({
             </div>
 
             <span className="rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-700">
-              Lead Score:{" "}
-              {lead.score ?? 0}/100
+              Lead Score: {displayScore}/100
             </span>
 
           </div>
 
-          {/* Summary */}
+          {/* CORE INTENT */}
 
-          <div className="shrink-0 space-y-2">
+          <div className="space-y-2">
 
             <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-400">
               Core Intent & Summary
             </h4>
 
             <div className="rounded-xl border border-zinc-200/60 bg-zinc-50 p-3.5 text-xs leading-relaxed text-zinc-700">
-              {leadSummary}
+              {displaySummary}
             </div>
 
           </div>
 
-          {/* Intent */}
+          {/* REQUIREMENTS + CONCERNS */}
 
-          <div className="mt-5 shrink-0 space-y-2">
+          <div className="mt-5 grid grid-cols-2 gap-3">
 
-            <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-400">
-              Customer Intent
-            </h4>
-
-            <div className="rounded-xl border border-zinc-200/60 bg-white p-3.5 text-xs leading-relaxed text-zinc-700">
-              {leadIntent}
-            </div>
-
-          </div>
-
-          {/* Requirements / Concerns */}
-
-          <div className="mt-5 grid shrink-0 grid-cols-2 gap-3">
+            {/* REQUIREMENTS */}
 
             <div className="rounded-xl border border-zinc-200/70 bg-white p-3.5">
 
@@ -745,11 +1957,60 @@ export default function LeadDetail({
 
               </h5>
 
-              <p className="text-xs leading-relaxed text-zinc-700">
-                {keyRequirements}
-              </p>
+              {requirementItems.length >
+              0 ? (
+
+                <ul className="list-disc space-y-1.5 pl-4 text-xs leading-relaxed text-zinc-700">
+
+                  {requirementItems.map(
+                    (
+                      item,
+                      index
+                    ) => (
+                      <li key={index}>
+                        {item}
+                      </li>
+                    )
+                  )}
+
+                </ul>
+
+              ) : (
+
+                <ul className="list-disc space-y-1.5 pl-4 text-xs leading-relaxed text-zinc-700">
+
+                  <li>
+                    Property:{" "}
+                    {lead.property_requirement ??
+                      lead.propertyType ??
+                      "Not specified"}
+                  </li>
+
+                  <li>
+                    Location:{" "}
+                    {lead.location ??
+                      "Not specified"}
+                  </li>
+
+                  {lead.budget && (
+                    <li>
+                      Budget: {lead.budget}
+                    </li>
+                  )}
+
+                  {lead.timeline && (
+                    <li>
+                      Timeline:{" "}
+                      {lead.timeline}
+                    </li>
+                  )}
+
+                </ul>
+              )}
 
             </div>
+
+            {/* CONCERNS */}
 
             <div className="rounded-xl border border-zinc-200/70 bg-white p-3.5">
 
@@ -761,37 +2022,33 @@ export default function LeadDetail({
 
               </h5>
 
-              <p className="text-xs leading-relaxed text-zinc-700">
-                {objections}
-              </p>
+              <ul className="list-disc space-y-1.5 pl-4 text-xs leading-relaxed text-zinc-700">
+
+                {concernItems.map(
+                  (
+                    item,
+                    index
+                  ) => (
+                    <li key={index}>
+                      {item}
+                    </li>
+                  )
+                )}
+
+              </ul>
 
             </div>
-
           </div>
 
-          {/* Buying Window */}
+          {/* NEXT ACTION */}
 
-          {buyingWindow && (
-            <div className="mt-5 shrink-0 rounded-xl border border-zinc-200 bg-zinc-50 p-4">
-
-              <div className="text-xs font-bold uppercase tracking-wide text-zinc-500">
-                Buying Window
-              </div>
-
-              <div className="mt-1 text-sm font-medium text-zinc-800">
-                {buyingWindow}
-              </div>
-
-            </div>
-          )}
-
-          {/* Recommended Action */}
-
-          <div className="mt-5 shrink-0 rounded-xl border border-indigo-200 bg-indigo-50/50 p-4">
+          <div className="mt-5 rounded-xl border border-indigo-200 bg-indigo-50/50 p-4">
 
             <div className="mb-1.5 flex items-center gap-2">
 
-              <span>🎯</span>
+              <span className="text-base">
+                🎯
+              </span>
 
               <h5 className="text-xs font-bold uppercase tracking-wide text-indigo-950">
                 Recommended Next Action
@@ -800,220 +2057,100 @@ export default function LeadDetail({
             </div>
 
             <p className="text-xs font-medium leading-relaxed text-indigo-900">
-              {recommendedAction}
+              {displayNextAction}
             </p>
 
           </div>
 
-          {/* =================================================
-              SUGGESTED FOLLOW-UP
-          ================================================= */}
+          {/* SUGGESTED RESPONSE */}
 
-          <div className="mt-5 shrink-0 overflow-hidden rounded-2xl border border-indigo-200 bg-white shadow-sm">
+          <div
+            className={[
+              "mt-5 rounded-xl transition-all duration-500",
+              followUpUpdated
+                ? "bg-indigo-50/60 p-2 ring-2 ring-indigo-400 ring-offset-2"
+                : "",
+            ].join(" ")}
+          >
 
-            <div className="flex min-h-[72px] items-center justify-between border-b border-indigo-100 bg-indigo-50 px-5 py-3.5">
+            <div className="space-y-2">
 
-              <div>
+              <div className="flex items-center justify-between">
 
                 <div className="flex items-center gap-2">
 
-                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-600 text-sm text-white">
-                    ✉
-                  </span>
-
-                  <h4 className="text-sm font-bold text-indigo-950">
-                    Suggested Follow-up
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-400">
+                    Suggested Response
                   </h4>
 
+                  {followUpUpdated && (
+                    <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-indigo-700">
+                      Updated
+                    </span>
+                  )}
+
                 </div>
 
-                <p className="mt-1 text-[10px] text-indigo-700/70">
-                  Ready to send to the customer
-                </p>
+                <button
+                  type="button"
+                  onClick={copyResponse}
+                  className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800"
+                >
+                  {copied
+                    ? "Copied"
+                    : "Copy"}
+                </button>
 
               </div>
 
-              <button
-                type="button"
-                onClick={
-                  copyResponse
-                }
-                className="rounded-lg bg-white px-3 py-1.5 text-[11px] font-semibold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-indigo-50"
+              <div
+                className={[
+                  "rounded-xl border p-3 text-xs leading-relaxed text-zinc-700 transition-all duration-500",
+                  followUpUpdated
+                    ? "border-indigo-300 bg-white shadow-md"
+                    : "border-zinc-200/60 bg-zinc-50",
+                ].join(" ")}
               >
-                {copied
-                  ? "Copied"
-                  : "Copy"}
-              </button>
-
-            </div>
-
-            <div
-              className={
-                responseGlow
-                  ? "min-h-[120px] bg-white px-5 py-5 text-sm leading-7 text-zinc-800 shadow-[inset_0_0_35px_rgba(99,102,241,0.12)] ring-2 ring-inset ring-indigo-300 transition-all duration-500"
-                  : "min-h-[120px] bg-white px-5 py-5 text-sm leading-7 text-zinc-800 transition-all duration-500"
-              }
-            >
-              {suggestedResponse ? (
-                renderAIText(
-                  suggestedResponse
-                )
-              ) : (
-                <span className="text-zinc-400">
-                  Thinking...
-                </span>
-              )}
-            </div>
-
-          </div>
-
-          {/* =================================================
-              LOCATION INTELLIGENCE
-          ================================================= */}
-
-          <div className="mt-5 shrink-0 overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm">
-
-            {/* Location header */}
-
-            <div className="border-b border-zinc-100 px-5 py-4">
-
-              <div className="text-sm font-bold text-zinc-900">
-                Location Intelligence
+                {displaySuggestedResponse}
               </div>
-
-              <div className="mt-0.5 text-[11px] text-zinc-400">
-                {lead.location}
-              </div>
-
-            </div>
-
-            {/* MAP */}
-
-            <div className="relative h-[300px] min-h-[300px] w-full bg-zinc-100">
-
-              {mapUrl ? (
-                <iframe
-                  title={`Map of ${lead.location}`}
-                  src={mapUrl}
-                  className="absolute inset-0 h-full w-full border-0"
-                  loading="lazy"
-                  allowFullScreen
-                  referrerPolicy="strict-origin-when-cross-origin"
-                />
-              ) : (
-                <div className="flex h-full w-full flex-col items-center justify-center px-6 text-center">
-
-                  <div className="text-sm font-semibold text-zinc-700">
-                    {lead.location}
-                  </div>
-
-                  <p className="mt-1 max-w-xs text-xs text-zinc-400">
-                    Add your Google Maps API key to display the interactive map.
-                  </p>
-
-                  <a
-                    href={mapsSearchUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-3 inline-block rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-semibold text-white"
-                  >
-                    Open in Google Maps
-                  </a>
-
-                </div>
-              )}
-
-            </div>
-
-            {/* MARKET HEATMAP */}
-
-            <div className="shrink-0 border-t border-zinc-100 px-5 py-4">
-
-              <div className="flex items-center justify-between gap-4">
-
-                <div>
-
-                  <div className="text-xs font-bold uppercase tracking-wide text-zinc-700">
-                    Illustrative Market Heatmap
-                  </div>
-
-                  <div className="mt-0.5 text-[10px] text-zinc-400">
-                    Synthetic area comparison
-                  </div>
-
-                </div>
-
-                <div className="flex shrink-0 items-center gap-3 text-[10px] text-zinc-500">
-
-                  <span className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-full bg-red-500" />
-                    High
-                  </span>
-
-                  <span className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-full bg-orange-400" />
-                    Medium
-                  </span>
-
-                  <span className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                    Lower
-                  </span>
-
-                </div>
-
-              </div>
-
-              <div className="mt-4 space-y-2">
-
-                {marketAreas.map(
-                  (area) => (
-                    <div
-                      key={
-                        area.name
-                      }
-                      className="flex items-center gap-3"
-                    >
-
-                      <div className="w-28 shrink-0 text-xs font-medium text-zinc-600">
-                        {area.name}
-                      </div>
-
-                      <div className="h-2 flex-1 overflow-hidden rounded-full bg-zinc-100">
-
-                        <div
-                          className={marketBarClass(
-                            area.level
-                          )}
-                        />
-
-                      </div>
-
-                      <div className="w-24 shrink-0 text-right text-[11px] font-semibold text-zinc-700">
-                        {area.price}
-                      </div>
-
-                    </div>
-                  )
-                )}
-
-              </div>
-
-              <p className="mt-3 text-[9px] leading-relaxed text-zinc-400">
-                Illustrative figures for the interface only. They are not live market quotations.
-              </p>
 
             </div>
           </div>
+
+          {/* LOCATION MAP */}
+
+          <LeadLocationMap
+            location={
+              lead.location ??
+              "Bengaluru"
+            }
+            title={
+              lead.name ??
+              "Customer Location"
+            }
+          />
+
+          {/* PRICE HEAT MAP */}
+
+          <PropertyHeatMap
+            location={
+              lead.location ??
+              "Bengaluru"
+            }
+            budget={
+              lead.budget ?? ""
+            }
+          />
+
         </section>
 
-        {/* ===================================================
-            RIGHT AI ASSISTANT
-        =================================================== */}
+        {/* ====================================================
+            RIGHT DEAL STRATEGY ASSISTANT
+        ==================================================== */}
 
         <section className="flex min-h-0 w-1/2 flex-col overflow-hidden rounded-2xl border border-zinc-200/80 bg-white shadow-sm">
 
-          {/* Assistant header */}
+          {/* HEADER */}
 
           <div className="flex h-14 shrink-0 items-center justify-between border-b border-zinc-100 bg-zinc-50/40 px-5">
 
@@ -1027,68 +2164,64 @@ export default function LeadDetail({
 
             </div>
 
-            
+            <span className="text-[10px] font-medium text-zinc-400">
+              Context Grounded
+            </span>
 
           </div>
 
-          {/* Messages */}
+          {/* CHAT */}
 
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
 
             {loadingHistory ? (
+
               <div className="flex items-center gap-2 text-xs text-zinc-400">
 
                 <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-300 border-t-indigo-600" />
 
-                Thinking...
+                Preparing lead strategy...
 
               </div>
-            ) : messages.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-zinc-200 bg-zinc-50 p-4 text-xs text-zinc-500">
-                Ask AI anything about this lead.
-              </div>
+
             ) : (
+
               messages.map(
                 (
-                  chatMessage,
+                  message,
                   index
-                ) => {
+                ) => (
 
-                  const isUser =
-                    chatMessage.role ===
-                    "user";
+                  <div
+                    key={`${message.role}-${index}`}
+                    className={`flex ${
+                      message.role ===
+                      "user"
+                        ? "justify-end"
+                        : "justify-start"
+                    }`}
+                  >
 
-                  const alignmentClass =
-                    isUser
-                      ? "justify-end"
-                      : "justify-start";
-
-                  const bubbleClass =
-                    isUser
-                      ? "rounded-br-sm bg-indigo-600 text-white"
-                      : "rounded-bl-sm border border-zinc-200/60 bg-zinc-100 text-zinc-800";
-
-                  return (
                     <div
-                      key={`${chatMessage.role}-${index}`}
-                      className={`flex ${alignmentClass}`}
+                      className={[
+                        "max-w-[85%] rounded-2xl p-3.5 text-xs leading-relaxed",
+                        message.role ===
+                        "user"
+                          ? "rounded-br-sm bg-indigo-600 text-white"
+                          : "rounded-bl-sm border border-zinc-200/60 bg-zinc-100 text-zinc-800",
+                      ].join(" ")}
                     >
-                      <div
-                        className={`max-w-[85%] rounded-2xl p-3.5 text-xs leading-relaxed ${bubbleClass}`}
-                      >
-                        {isUser
-                          ? chatMessage.content
-                          : renderAIText(
-                              chatMessage.content
-                            )}
-                      </div>
+                      {message.content}
                     </div>
-                  );
-                }
+
+                  </div>
+
+                )
               )
             )}
 
             {sending && (
+
               <div className="flex justify-start">
 
                 <div className="rounded-2xl rounded-bl-sm bg-zinc-100 px-4 py-3 text-xs text-zinc-500">
@@ -1096,49 +2229,82 @@ export default function LeadDetail({
                 </div>
 
               </div>
+
             )}
 
           </div>
 
-          {/* Error */}
+          {/* ERROR */}
 
           {error && (
-            <div className="mx-4 mb-2 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+
+            <div className="mx-4 mb-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
               {error}
             </div>
+
           )}
 
-          {/* Consumable prompts */}
+          {/* ==================================================
+              CONSUMABLE SUGGESTIONS
+          ================================================== */}
 
-          {quickPrompts.length > 0 && (
-            <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-t border-zinc-100 bg-zinc-50/50 px-4 py-2">
+          <div className="flex min-h-[50px] shrink-0 items-center gap-1.5 overflow-x-auto border-t border-zinc-100 bg-zinc-50/50 px-4 py-2">
 
-              {quickPrompts.map(
-                (prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    onClick={() =>
-                      usePrompt(
-                        prompt
-                      )
-                    }
-                    className="whitespace-nowrap rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-[11px] font-medium text-zinc-600 transition-all duration-200 hover:border-indigo-400 hover:bg-indigo-50 hover:text-indigo-700 active:scale-95"
-                  >
-                    {prompt}
-                  </button>
-                )
-              )}
+            {visibleSuggestions.map(
+              (
+                suggestion,
+                index
+              ) => (
 
-            </div>
-          )}
+                <button
+                  key={`${suggestion}-${index}`}
+                  type="button"
+                  onClick={() =>
+                    consumeSuggestion(
+                      suggestion
+                    )
+                  }
+                  className="
+                    shrink-0
+                    whitespace-nowrap
+                    rounded-full
+                    border
+                    border-zinc-200
+                    bg-white
+                    px-3
+                    py-1.5
+                    text-[11px]
+                    font-medium
+                    text-zinc-600
+                    shadow-sm
+                    transition-all
+                    hover:border-indigo-400
+                    hover:bg-indigo-50
+                    hover:text-indigo-700
+                    active:scale-95
+                  "
+                >
+                  {suggestion}
+                </button>
 
-          {/* Input */}
+              )
+            )}
+
+            {visibleSuggestions.length ===
+              0 && (
+
+              <span className="text-[11px] text-zinc-400">
+                Suggestions exhausted for this lead.
+              </span>
+
+            )}
+
+          </div>
+
+          {/* INPUT */}
 
           <form
-            onSubmit={
-              handleSend
-            }
+            onSubmit={handleSend}
             className="flex shrink-0 items-center gap-2 border-t border-zinc-200 p-3"
           >
 
@@ -1151,7 +2317,19 @@ export default function LeadDetail({
                 )
               }
               placeholder="Ask anything about this lead..."
-              className="flex-1 rounded-xl border border-zinc-200 bg-zinc-50 px-3.5 py-2 text-xs text-zinc-800 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
+              className="
+                flex-1
+                rounded-xl
+                border
+                border-zinc-200
+                bg-zinc-50
+                px-3.5
+                py-2
+                text-xs
+                text-zinc-800
+                outline-none
+                focus:border-indigo-500
+              "
             />
 
             <button
@@ -1160,7 +2338,18 @@ export default function LeadDetail({
                 sending ||
                 !input.trim()
               }
-              className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+              className="
+                rounded-xl
+                bg-indigo-600
+                px-4
+                py-2
+                text-xs
+                font-semibold
+                text-white
+                transition-colors
+                hover:bg-indigo-700
+                disabled:opacity-50
+              "
             >
               {sending
                 ? "..."
@@ -1168,6 +2357,7 @@ export default function LeadDetail({
             </button>
 
           </form>
+
         </section>
       </div>
     </div>
