@@ -1,179 +1,269 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-
 type Props = {
     location: string;
     title?: string;
 };
 
-declare global {
-    interface Window {
-        google?: any;
-    }
+type Coordinates = {
+    lat: number;
+    lon: number;
+    zoom: number;
+};
+
+/*
+ * Demo-friendly coordinates for the locations used by the CRM.
+ * These are only used to position the map.
+ */
+const LOCATION_COORDINATES: Record<
+string,
+Coordinates
+> = {
+    indiranagar: {
+        lat: 12.9719,
+        lon: 77.6412,
+        zoom: 14,
+    },
+
+    koramangala: {
+        lat: 12.9352,
+        lon: 77.6245,
+        zoom: 14,
+    },
+
+    "hsr layout": {
+        lat: 12.9116,
+        lon: 77.6389,
+        zoom: 14,
+    },
+
+    whitefield: {
+        lat: 12.9698,
+        lon: 77.75,
+        zoom: 13,
+    },
+
+    bellandur: {
+        lat: 12.925,
+        lon: 77.6762,
+        zoom: 14,
+    },
+
+    hebbal: {
+        lat: 13.0358,
+        lon: 77.597,
+        zoom: 14,
+    },
+
+    thrissur: {
+        lat: 10.5276,
+        lon: 76.2144,
+        zoom: 13,
+    },
+
+    punkunnam: {
+        lat: 10.535,
+        lon: 76.2005,
+        zoom: 14,
+    },
+
+    ayyanthole: {
+        lat: 10.5158,
+        lon: 76.1907,
+        zoom: 14,
+    },
+
+    kochi: {
+        lat: 9.9312,
+        lon: 76.2673,
+        zoom: 12,
+    },
+
+    kakkanad: {
+        lat: 10.0159,
+        lon: 76.3419,
+        zoom: 14,
+    },
+
+    "new delhi": {
+        lat: 28.6139,
+        lon: 77.209,
+        zoom: 12,
+    },
+
+    mumbai: {
+        lat: 19.076,
+        lon: 72.8777,
+        zoom: 12,
+    },
+
+    hyderabad: {
+        lat: 17.385,
+        lon: 78.4867,
+        zoom: 12,
+    },
+
+    chennai: {
+        lat: 13.0827,
+        lon: 80.2707,
+        zoom: 12,
+    },
+
+    pune: {
+        lat: 18.5204,
+        lon: 73.8567,
+        zoom: 12,
+    },
+};
+
+function normalize(
+    value: string
+) {
+    return value
+    .toLowerCase()
+    .replace(
+        /[^a-z0-9\s]/g,
+        " "
+    )
+    .replace(
+        /\s+/g,
+        " "
+    )
+    .trim();
 }
 
-const GOOGLE_MAPS_KEY =
-process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+function getCoordinates(
+    location: string
+): Coordinates {
+    const normalized =
+    normalize(
+        location
+    );
+
+    /*
+     * Exact / substring match.
+     */
+    const match =
+    Object.entries(
+        LOCATION_COORDINATES
+    ).find(
+        ([name]) =>
+        normalized ===
+        name ||
+        normalized.includes(
+            name
+        ) ||
+        name.includes(
+            normalized
+        )
+    );
+
+    if (match) {
+        return match[1];
+    }
+
+    /*
+     * Bengaluru fallback.
+     */
+    if (
+        normalized.includes(
+            "bengaluru"
+        ) ||
+        normalized.includes(
+            "bangalore"
+        )
+    ) {
+        return {
+            lat: 12.9716,
+            lon: 77.5946,
+            zoom: 12,
+        };
+    }
+
+    /*
+     * Kerala fallback.
+     */
+    if (
+        normalized.includes(
+            "kerala"
+        )
+    ) {
+        return {
+            lat: 10.8505,
+            lon: 76.2711,
+            zoom: 8,
+        };
+    }
+
+    /*
+     * Generic India fallback.
+     */
+    return {
+        lat: 20.5937,
+        lon: 78.9629,
+        zoom: 5,
+    };
+}
 
 export default function LeadLocationMap({
     location,
     title = "Customer Location",
 }: Props) {
-    const mapRef =
-    useRef<HTMLDivElement | null>(null);
+    const cleanLocation =
+    location?.trim() ||
+    "Bengaluru";
 
-    const [mapError, setMapError] =
-    useState(false);
-
-    useEffect(() => {
-        if (
-            !mapRef.current ||
-            !location.trim()
-        ) {
-            return;
-        }
-
-        let cancelled = false;
-
-        const initializeMap = () => {
-            if (
-                cancelled ||
-                !window.google?.maps ||
-                !mapRef.current
-            ) {
-                return;
-            }
-
-            const geocoder =
-            new window.google.maps.Geocoder();
-
-            geocoder.geocode(
-                {
-                    address: location,
-                },
-                (
-                    results: any[],
-                 status: string
-                ) => {
-                    if (
-                        cancelled ||
-                        status !== "OK" ||
-                        !results?.[0]
-                    ) {
-                        setMapError(true);
-                        return;
-                    }
-
-                    const position =
-                    results[0].geometry.location;
-
-                    const map =
-                    new window.google.maps.Map(
-                        mapRef.current,
-                        {
-                            center: position,
-                            zoom: 13,
-                            disableDefaultUI: true,
-                            zoomControl: true,
-                            fullscreenControl: true,
-                            streetViewControl: false,
-                            mapTypeControl: false,
-                            clickableIcons: false,
-                        }
-                    );
-
-                    new window.google.maps.Marker({
-                        map,
-                        position,
-                        title,
-                    });
-                }
-            );
-        };
-
-        if (
-            window.google?.maps
-        ) {
-            initializeMap();
-
-            return () => {
-                cancelled = true;
-            };
-        }
-
-        if (!GOOGLE_MAPS_KEY) {
-            setMapError(true);
-
-            return () => {
-                cancelled = true;
-            };
-        }
-
-        const existingScript =
-        document.querySelector(
-            'script[data-masal-google-maps="true"]'
-        );
-
-        if (existingScript) {
-            existingScript.addEventListener(
-                "load",
-                initializeMap
-            );
-
-            return () => {
-                cancelled = true;
-
-                existingScript.removeEventListener(
-                    "load",
-                    initializeMap
-                );
-            };
-        }
-
-        const script =
-        document.createElement(
-            "script"
-        );
-
-        script.src =
-        `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(
-            GOOGLE_MAPS_KEY
-        )}&libraries=places`;
-
-        script.async = true;
-        script.defer = true;
-        script.dataset.masalGoogleMaps =
-        "true";
-
-    script.addEventListener(
-        "load",
-        initializeMap
+    const {
+        lat,
+        lon,
+        zoom,
+    } =
+    getCoordinates(
+        cleanLocation
     );
 
-    script.addEventListener(
-        "error",
-        () => {
-            setMapError(true);
-        }
-    );
+    /*
+     * Small bounding box around the selected point.
+     * This gives OpenStreetMap a useful initial viewport.
+     */
+    const delta =
+    zoom >= 14
+    ? 0.045
+    : zoom >= 12
+    ? 0.12
+    : 0.7;
 
-    document.head.appendChild(
-        script
-    );
+    const left =
+    lon - delta;
 
-    return () => {
-        cancelled = true;
+    const right =
+    lon + delta;
 
-        script.removeEventListener(
-            "load",
-            initializeMap
-        );
-    };
-    }, [location, title]);
+    const bottom =
+    lat - delta;
+
+    const top =
+    lat + delta;
+
+    const mapUrl =
+    `https://www.openstreetmap.org/export/embed.html?` +
+    `bbox=${encodeURIComponent(
+        `${left},${bottom},${right},${top}`
+    )}` +
+    `&layer=mapnik` +
+    `&marker=${encodeURIComponent(
+        `${lat},${lon}`
+    )}`;
+
+    const openMapsUrl =
+    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+        cleanLocation
+    )}`;
 
     return (
         <section className="mt-5">
+        {/* HEADER */}
+
         <div className="mb-2 flex items-center justify-between">
         <div>
         <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-400">
@@ -181,14 +271,12 @@ export default function LeadLocationMap({
         </h4>
 
         <p className="mt-0.5 text-[11px] text-zinc-400">
-        {location}
+        {cleanLocation}
         </p>
         </div>
 
         <a
-        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-            location
-        )}`}
+        href={openMapsUrl}
         target="_blank"
         rel="noreferrer"
         className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800"
@@ -197,31 +285,39 @@ export default function LeadLocationMap({
         </a>
         </div>
 
-        <div
-        ref={mapRef}
-        className="relative h-56 w-full overflow-hidden rounded-xl border border-zinc-200 bg-zinc-100"
-        >
-        {mapError && (
-            <div className="flex h-full items-center justify-center px-6 text-center">
-            <div>
-            <div className="text-sm font-semibold text-zinc-600">
-            {location}
-            </div>
+        {/* MAP */}
 
-            <a
-            href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                location
-            )}`}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-1 inline-block text-xs font-medium text-indigo-600"
-            >
-            View location on Google Maps
-            </a>
-            </div>
-            </div>
-        )}
+        <div className="relative h-56 w-full overflow-hidden rounded-xl border border-zinc-200 bg-zinc-100">
+
+        <iframe
+        title={`${title} location map`}
+        src={mapUrl}
+        width="100%"
+        height="100%"
+        loading="lazy"
+        style={{
+            border: 0,
+        }}
+        referrerPolicy="strict-origin-when-cross-origin"
+        />
+
+        {/* Location badge */}
+
+        <div className="pointer-events-none absolute bottom-3 left-3 rounded-lg border border-white/80 bg-white/90 px-3 py-2 shadow-md backdrop-blur">
+
+        <div className="text-[9px] font-bold uppercase tracking-wide text-indigo-600">
+        Customer Location
         </div>
+
+        <div className="mt-0.5 text-xs font-semibold text-zinc-800">
+        {cleanLocation}
+        </div>
+        </div>
+        </div>
+
+        <p className="mt-1.5 text-[9px] text-zinc-400">
+        Map data © OpenStreetMap contributors
+        </p>
         </section>
     );
 }
