@@ -2164,9 +2164,7 @@ ${question}
 
             </div>
 
-            <span className="text-[10px] font-medium text-zinc-400">
-              Context Grounded
-            </span>
+
 
           </div>
 
